@@ -11,13 +11,16 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"sync"
 
 	"github.com/gin-gonic/gin"
 	. "github.com/router-for-me/CLIProxyAPI/v6/internal/constant"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
 	responsesconverter "github.com/router-for-me/CLIProxyAPI/v6/internal/translator/openai/openai/responses"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/api/handlers"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -171,6 +174,55 @@ func (h *OpenAIAPIHandler) Completions(c *gin.Context) {
 		h.handleCompletionsNonStreamingResponse(c, rawJSON)
 	}
 
+}
+
+// Embeddings handles the /v1/embeddings endpoint.
+// It supports only OpenAI-compatible upstream providers and rejects streaming.
+func (h *OpenAIAPIHandler) Embeddings(c *gin.Context) {
+	rawJSON, err := c.GetRawData()
+	if err != nil {
+		c.JSON(http.StatusBadRequest, handlers.ErrorResponse{
+			Error: handlers.ErrorDetail{
+				Message: fmt.Sprintf("Invalid request: %v", err),
+				Type:    "invalid_request_error",
+			},
+		})
+		return
+	}
+
+	streamResult := gjson.GetBytes(rawJSON, "stream")
+	if streamResult.Type == gjson.True {
+		c.JSON(http.StatusBadRequest, handlers.ErrorResponse{
+			Error: handlers.ErrorDetail{
+				Message: "Streaming not supported for embeddings",
+				Type:    "invalid_request_error",
+			},
+		})
+		return
+	}
+
+	modelName := gjson.GetBytes(rawJSON, "model").String()
+	if !h.isOpenAICompatOnlyModel(modelName) {
+		c.JSON(http.StatusBadRequest, handlers.ErrorResponse{
+			Error: handlers.ErrorDetail{
+				Message: "Embeddings only supported for OpenAI-compat models",
+				Type:    "invalid_request_error",
+			},
+		})
+		return
+	}
+
+	c.Header("Content-Type", "application/json")
+	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
+	resp, upstreamHeaders, errMsg := h.ExecuteWithAuthManager(cliCtx, h.HandlerType(), modelName, rawJSON, "embeddings")
+	if errMsg != nil {
+		h.WriteErrorResponse(c, errMsg)
+		cliCancel(errMsg.Error)
+		return
+	}
+	handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
+	_, _ = c.Writer.Write(resp)
+	cliCancel()
 }
 
 // convertCompletionsRequestToChatCompletions converts OpenAI completions API request to chat completions format.
@@ -417,6 +469,50 @@ func convertChatCompletionsStreamChunkToCompletions(chunkData []byte) []byte {
 	}
 
 	return []byte(out)
+}
+
+func (h *OpenAIAPIHandler) isOpenAICompatOnlyModel(modelName string) bool {
+	modelName = strings.TrimSpace(modelName)
+	if modelName == "" {
+		return false
+	}
+
+	resolvedModelName := modelName
+	initialSuffix := thinking.ParseSuffix(modelName)
+	if initialSuffix.ModelName == "auto" {
+		resolvedBase := util.ResolveAutoModel(initialSuffix.ModelName)
+		if initialSuffix.HasSuffix {
+			resolvedModelName = fmt.Sprintf("%s(%s)", resolvedBase, initialSuffix.RawSuffix)
+		} else {
+			resolvedModelName = resolvedBase
+		}
+	} else {
+		resolvedModelName = util.ResolveAutoModel(modelName)
+	}
+
+	parsed := thinking.ParseSuffix(resolvedModelName)
+	baseModel := strings.TrimSpace(parsed.ModelName)
+	if baseModel == "" {
+		return false
+	}
+
+	reg := registry.GetGlobalRegistry()
+	modelID := baseModel
+	providers := reg.GetModelProviders(modelID)
+	if len(providers) == 0 && modelID != resolvedModelName {
+		modelID = resolvedModelName
+		providers = reg.GetModelProviders(modelID)
+	}
+	if len(providers) == 0 {
+		return false
+	}
+	for _, provider := range providers {
+		info := reg.GetModelInfo(modelID, provider)
+		if info == nil || !strings.EqualFold(strings.TrimSpace(info.Type), "openai-compatibility") {
+			return false
+		}
+	}
+	return true
 }
 
 // handleNonStreamingResponse handles non-streaming chat completion responses
